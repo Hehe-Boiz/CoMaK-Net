@@ -1,1 +1,1 @@
-# BioMamba
+# CoMak-Net
