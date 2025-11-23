@@ -1,0 +1,25 @@
+# --- Core Deep Learning Framework ---
+torch>=2.0.0
+torchvision
+torchsummary
+
+# --- Computer Vision & Models ---
+timm
+einops
+grad-cam
+natten
+mamba-ssm
+
+# --- Data Processing & Augmentation ---
+numpy
+pandas
+scikit-learn
+scikit-image
+Pillow
+medmnist==3.0.2
+torchattacks
+
+# --- Utilities & Visualization ---
+fvcore
+tqdm
+fire
