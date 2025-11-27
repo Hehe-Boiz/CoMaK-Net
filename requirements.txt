@@ -7,8 +7,8 @@ torchsummary
 timm
 einops
 grad-cam
-natten
-mamba-ssm
+#natten
+#mamba-ssm
 
 # --- Data Processing & Augmentation ---
 numpy
