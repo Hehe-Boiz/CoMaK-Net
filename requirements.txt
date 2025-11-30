@@ -1,13 +1,14 @@
 # --- Core Deep Learning Framework ---
-torch>=2.0.0
-torchvision
+torch==2.5.0
+torchvision==0.20.0
 torchsummary
 
 # --- Computer Vision & Models ---
 timm
 einops
 grad-cam
-#natten
+-f https://shi-labs.com/natten/wheels/
+natten==0.17.3+torch250cu124
 #mamba-ssm
 
 # --- Data Processing & Augmentation ---
