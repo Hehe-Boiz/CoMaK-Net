@@ -100,6 +100,61 @@ class PatchEmbed(nn.Module):
     def forward(self, x):
         return self.norm(self.conv(self.avgpool(x)))
 
+class StarReLU(nn.Module):
+    """
+    StarReLU: s * relu(x) ** 2 + b
+    """
+    def __init__(self, scale_value=1.0, bias_value=0.0,
+        scale_learnable=True, bias_learnable=True,
+        mode=None, inplace=False):
+        super().__init__()
+        self.inplace = inplace
+        self.relu = nn.ReLU(inplace=inplace)
+        self.scale = nn.Parameter(scale_value * torch.ones(1),
+            requires_grad=scale_learnable)
+        self.bias = nn.Parameter(bias_value * torch.ones(1),
+            requires_grad=bias_learnable)
+    def forward(self, x):
+        return self.scale * self.relu(x)**2 + self.bias
+
+
+class SepConv(nn.Module):
+    r"""
+    Inverted separable convolution from MobileNetV2: https://arxiv.org/abs/1801.04381.
+
+    - Added inverted residual connection for better performance.
+    """
+
+    def __init__(self, dim, expansion_ratio=2,
+                 act1_layer=StarReLU, act2_layer=nn.Identity,
+                 bias=False, kernel_size=7, padding=3, residual=False,
+                 **kwargs, ):
+        super().__init__()
+        self.residual = residual
+        med_channels = int(expansion_ratio * dim)
+        self.pwconv1 = nn.Linear(dim, med_channels, bias=bias)
+        self.act1 = act1_layer()
+        self.dwconv = nn.Conv2d(
+            med_channels, med_channels, kernel_size=kernel_size,
+            padding=padding, groups=med_channels, bias=bias)  # depthwise conv
+        self.act2 = act2_layer()
+        self.pwconv2 = nn.Linear(med_channels, dim, bias=bias)
+
+    def forward(self, x):
+        shortcut = x
+
+        x = self.pwconv1(x)
+        x = self.act1(x)
+
+        x = x.permute(0, 3, 1, 2)  # (B, H, W, C) -> (B, C, H, W)
+        x = self.dwconv(x)
+        x = x.permute(0, 2, 3, 1)  # (B, C, H, W) -> (B, H, W, C)
+
+        x = self.act2(x)
+        x = self.pwconv2(x)
+        x = x + shortcut if self.residual else x  # Inverted residual (in the bottlenech layers)
+        return x
+
 class h_sigmoid(nn.Module):
     def __init__(self, inplace=True):
         super(h_sigmoid, self).__init__()
