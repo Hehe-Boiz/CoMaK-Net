@@ -51,17 +51,23 @@ class ConvBNReLU(nn.Module):
             kernel_size,
             stride,
             groups=1):
-        super(ConvBNReLU, self).__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride,
-                              padding=1, groups=groups, bias=False)
-        self.norm = nn.BatchNorm2d(out_channels, eps=NORM_EPS)
-        self.act = nn.ReLU(inplace=True)
+        super(ConvBNReLU, self).__init__()   
+        self.block = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=1,
+                groups=groups,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels, eps=NORM_EPS),
+            nn.ReLU(inplace=True),
+        )
 
     def forward(self, x):
-        x = self.conv(x)
-        x = self.norm(x)
-        x = self.act(x)
-        return x
+        return self.block(x)
 
 
 def _make_divisible(v, divisor, min_value=None):
