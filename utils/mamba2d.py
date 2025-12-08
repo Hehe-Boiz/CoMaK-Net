@@ -44,13 +44,12 @@ class Mamba2DBlock(nn.Module):
         # inverse softplus
         inv_dt = dt + torch.log(-torch.expm1(-dt))
         dt_init_std = self.dt_rank ** -0.5 * dt_scale
-        
+
+
+        #=== Mixer Process ===# 
         # x -> [deltaT, deltaL, B, C]
         self.x_proj = nn.Linear(self.d_inner, 2*self.dt_rank + 2*self.d_state)
 
-        # channel last
-        # deltaT, deltaL: (B,H,W,dt_rank) -> (B, H, W, ED) 
-     
         self.dt_projT = nn.Linear(self.dt_rank, self.d_inner)
         self.dt_projL = nn.Linear(self.dt_rank, self.d_inner)
 
@@ -64,7 +63,8 @@ class Mamba2DBlock(nn.Module):
         else:
             raise NotImplementedError
 
-        with torch.no_grad():# Turn off gradient tracking in this block 
+        # Turn off gradient tracking in this block
+        with torch.no_grad(): 
             self.dt_projT.bias.copy_(inv_dt)
             self.dt_projL.bias.copy_(inv_dt)
 
@@ -122,7 +122,8 @@ class Mamba2DBlock(nn.Module):
                 self.dt_projL_b.bias.copy_(inv_dt)
 
     def proj_and_discretise(self, x: torch.Tensor):
-        # Param: x = (B, H, W, ED) ED==d_inner
+
+        # Param: x = (B, H, W, ED) ED==d_inner, là kênh
         # return: 
         # deltaAT, deltaAL, BXT, BXL, C
         # shapes: (B, H, W, ED, N) / (B, H, W, ED, N) / ... / (B, H, W, N)
@@ -133,12 +134,13 @@ class Mamba2DBlock(nn.Module):
         # (B, H, W, 2*dt_rank + 2*d_state)
         delta2BC = self.x_proj(x)
 
+        # deltaT, deltaL: (B,H,W,dt_rank) -> (B, H, W, ED) 
+        # B: (B,H,W,N)  
         deltaT, deltaL, B, C = torch.split(
                 delta2BC,
                 [self.dt_rank, self.dt_rank, self.dt_state, self.dt_state],
                 dim=-1,
                 )
-        # (B, H, W, ED)
         deltaT = F.softplus(self.dt_projT(deltaT))
         deltaL = F.softplus(self.dt_projL(deltaL))
 
@@ -147,12 +149,12 @@ class Mamba2DBlock(nn.Module):
         deltaAT = torch.exp(deltaT.unsqueeze(-1) * AT)
         deltaAL = torch.exp(deltaL.unsqueeze(-1) * AL)
 
-        # B: (B,H,W,N) -> (B,H,W,1,N) sau đó, broadcast theo ED
+        # B: (B,H,W,N) -> (B,H,W,1,N) broadcast theo ED
         deltaBT = deltaT.unsqueeze(-1)*B.unsqueeze(-2) # (B,H,W,ED,N)
         deltaBL = deltaL.unsqueeze(-1)*B.unsqueeze(-2) # (B,H,W,ED,N)
 
         BXT = deltaBT * x.unsqueeze(-1) # (B,H,W,ED,N)
-        BXL = deltaBL * x.unsqueeze(-1) 
+        BXL = deltaBL * x.unsqueeze(-1) # (B,H,W,ED,N)
 
         # ép kiểu tránh mismatch
         deltaAT = deltaAT.type(dtype=x.dtype)
@@ -166,12 +168,11 @@ class Mamba2DBlock(nn.Module):
         # forward scan #
         deltaAT, detaAL, BXT, BXL, C = self.proj_and_discretise(x)
 
+        # selective scan with tensor.shape(B,H,W,ED,N)
         hs = wavefront_scan_cuda(deltaAT, deltaAL, BXT, BXL)
 
         y = (hs @ C.unsqueeze(-1)).squeeze(-1)
         
-        # unsqueeze(0) để PyTorch biết broadcast như nào
-        # D -> (1, 1, d_inner) | (1, 1, 1, d_inner)
         # (B, H, W, d_inner)
         y = y + x * self.D.unsqueeze(0).unsqueeze(0).unsqueeze(0)
         
