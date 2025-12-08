@@ -90,7 +90,7 @@ class Mamba2DBlock(nn.Module):
         # Sepecific Parameter for backward scan
         # Forward dùng AT/AL/D chung
         if self.double_scans:
-            ATb = torch.arrange(1, self.d_state + 1,
+            ATb = torch.arange(1, self.d_state + 1,
                                 dtype=torch.float32).repeat(self.d_inner, 1)
             ALb = ATb.detach().clone()
 
@@ -105,9 +105,9 @@ class Mamba2DBlock(nn.Module):
 
             self.x_proj_b = nn.Linear(self.d_inner, 2*self.dt_rank + 2*self.d_state)
 
-            self.dt_projT_b = nn.Linear(self.dt_rank, self.dt_inner)
+            self.dt_projT_b = nn.Linear(self.dt_rank, self.d_inner)
 
-            self.dt_projL_b = nn.Linear(self.dt_rank, self.dt_inner)
+            self.dt_projL_b = nn.Linear(self.dt_rank, self.d_inner)
             if dt_init == "constant":
                 nn.init.constant_(self.dt_projT_b.weight, dt_init_std)
                 nn.init.constant_(self.dt_projL_b.weight, dt_init_std)
@@ -133,7 +133,7 @@ class Mamba2DBlock(nn.Module):
         # (B, H, W, 2*dt_rank + 2*d_state)
         delta2BC = self.x_proj(x)
 
-        deltaT, dettaL, B, C = torch.split(
+        deltaT, deltaL, B, C = torch.split(
                 delta2BC,
                 [self.dt_rank, self.dt_rank, self.dt_state, self.dt_state],
                 dim=-1,
@@ -149,7 +149,6 @@ class Mamba2DBlock(nn.Module):
 
         # B: (B,H,W,N) -> (B,H,W,1,N) sau đó, broadcast theo ED
         deltaBT = deltaT.unsqueeze(-1)*B.unsqueeze(-2) # (B,H,W,ED,N)
-        
         deltaBL = deltaL.unsqueeze(-1)*B.unsqueeze(-2) # (B,H,W,ED,N)
 
         BXT = deltaBT * x.unsqueeze(-1) # (B,H,W,ED,N)
@@ -161,7 +160,7 @@ class Mamba2DBlock(nn.Module):
         BXT = BXT.type(dtype=x.dtype)
         BXL = BXL.type(dtype=x.dtype)
         
-        return deltaAT, detaAL, BXT, BXL, C
+        return deltaAT, deltaAL, BXT, BXL, C
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # forward scan #
@@ -169,23 +168,23 @@ class Mamba2DBlock(nn.Module):
 
         hs = wavefront_scan_cuda(deltaAT, deltaAL, BXT, BXL)
 
-        y = (hs @ C.unsqueeze(-1)).unsqueeze(-1)
+        y = (hs @ C.unsqueeze(-1)).squeeze(-1)
         
         # unsqueeze(0) để PyTorch biết broadcast như nào
         # D -> (1, 1, d_inner) | (1, 1, 1, d_inner)
         # (B, H, W, d_inner)
-        y = y + x * self.D.unsqueeze(0).unsqueeze(0)
+        y = y + x * self.D.unsqueeze(0).unsqueeze(0).unsqueeze(0)
         
         # optioanl backward scan (bi-directional)
         if self.double_scans:
             x_b = torch.flip(x, dim=[1,2])
-            deltaAT_b = deltaAL_b, BXT_b, BXL_b, C_b = self.proj_and_discretise(x_b)
+            deltaAT_b, deltaAL_b, BXT_b, BXL_b, C_b = self.proj_and_discretise(x_b)
             hs_b = wavefront_scan_cuda(
-                    deltaAT_b, deltaAL_b, BXT_b, BXT_b
+                    deltaAT_b, deltaAL_b, BXT_b, BXL_b
                     )
             y_b = (hs_b @ C_b.unsqueeze(-1)).squeeze(-1)
             y_b = y_b + x_b * self.D.unsqueeze(0).unsqueeze(0)
-
+            
             # Avarage 2 direction
             y = ( y + y_b )/2
         return y
@@ -194,7 +193,6 @@ class M2D(nn.Module):
         Minimal version of Mamba 2D block, adapted from base 1D implementation:
         https://github.com/alxndrTL/mamba.py
     '''
-
     def __init__(self,
                  d_model: int,  # D | Số channel gốc của feature map
                  d_state: int = 16,  # N in paper/comments
@@ -221,11 +219,11 @@ class M2D(nn.Module):
                                   act1_layer=StarReLU, act2_layer=StarReLU,
                                   bias=False, kernel_size=3, padding=1, residual=False) if local_path else None
 
-        self.ssm_score = Mamba2DBlocK(
+        self.ssm_score = Mamba2DBlock(
                 d_inner         = self.d_inner,
                 d_state         = d_state,
                 dt_rank         = dt_rank,
-                dt_min          = dt_minm
+                dt_min          = dt_min,
                 dt_max          = dt_max,
                 dt_init         = dt_init,
                 dt_scale        = dt_scale,
@@ -233,12 +231,12 @@ class M2D(nn.Module):
                 double_scans    = double_scans,
                 )
         self.in_block   = nn.Sequential(
-                    nn.Linear(self.d_model, self.d_inner)
-                    nn.GELU()
+                    nn.Linear(self.d_model, self.d_inner),
+                    nn.GELU(),
                 )
         self.out_block  = nn.Sequential(
-                    nn.GELU()
-                    nn.Linear(self.d_inner, self.d_model)
+                    nn.GELU(),
+                    nn.Linear(self.d_inner, self.d_model),
                 )
         """
         self.in_proj    = nn.Linear(self.d_model, self.d_inner) 
