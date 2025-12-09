@@ -6,9 +6,9 @@ from natten import NeighborhoodAttention2D as NeighborhoodAttention
 from functools import partial
 from timm.models.layers import DropPath, trunc_normal_
 import torch
+from utils.utils import NORM_EPS
 
 is_natten_post_017 = hasattr(natten, "context")
-NORM_EPS = 1e-5
 
 class LocalityFeedForward(nn.Module):
     def __init__(self, in_dim=64, out_dim=96, kernel_size=3, stride=1, expand_ratio=4., act='hs+se', reduction=4,

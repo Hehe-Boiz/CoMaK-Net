@@ -3,7 +3,7 @@ from torch import nn
 from functools import partial
 import math
 
-
+NORM_EPS = 1e-5
 
 def merge_pre_bn(module, pre_bn_1, pre_bn_2=None):
     """ Merge pre BN to reduce inference runtime.
