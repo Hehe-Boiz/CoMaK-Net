@@ -215,6 +215,24 @@ class SELayer(nn.Module):
         return x * y
 
 
+class ProjectionGating(nn.Module):
+    def __init__(self, C, Cp):
+        super().__init__()
+        self.pw_proj = nn.Conv2d(C, Cp, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn_proj = nn.BatchNorm2d(Cp)
+
+        self.act_mid = nn.ReLU()
+
+        self.pw_expand = nn.Conv2d(Cp, C, kernel_size=1, stride=1, padding=0, bias=False)
+        self.act_gate = nn.Sigmoid()
+
+    def forward(self, x):
+        x = self.pw_proj(x)  # C → Cp
+        x = self.bn_proj(x)
+        x = self.act_mid(x)
+        x = self.pw_expand(x)  # Cp → C
+        x = self.act_gate(x)  # gating
+        return x
 class LocalExtractor(nn.Module):
     def __init__(
         self,
@@ -230,39 +248,31 @@ class LocalExtractor(nn.Module):
         Cp = int(C * projection_ratio)
         self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
 
-        self.pw_expand_ex   = nn.Conv2d(C, Ce, kernel_size=1, stride=1, padding=0, bias=False)
-        self.pw_proj_ex     = nn.Conv2d(Ce, C, kernel_size=1, stride=1, padding=0, bias=False)
+        self.pw_expand   = nn.Conv2d(C, Ce, kernel_size=1, stride=1, padding=0, bias=False)
+        self.pw_proj     = nn.Conv2d(Ce, C, kernel_size=1, stride=1, padding=0, bias=False)
+        self.dw     = nn.Conv2d(Ce, Ce, kernel_size=3, stride=1, padding=1, groups=Ce, bias=False)
 
-        self.pw_proj_proj = nn.Conv2d(C, Cp, kernel_size=1, stride=1, padding=0, bias=False)
-        self.pw_expand_proj = nn.Conv2d(Cp, C, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn_in  = nn.BatchNorm2d(C)
+        self.bn1    = nn.BatchNorm2d(Ce)
+        self.bn2    = nn.BatchNorm2d(Ce)
+        self.bn3    = nn.BatchNorm2d(C)
 
-        self.dw  = nn.Conv2d(Ce, Ce, kernel_size=3, stride=1, padding=1, groups=Ce, bias=False)
-
-        self.bn_in = nn.BatchNorm2d(C)
-        self.bn1 = nn.BatchNorm2d(Ce)
-        self.bn2 = nn.BatchNorm2d(Ce)
-        self.bn3 = nn.BatchNorm2d(C)
-        self.bn4 = nn.BatchNorm2d(Cp)
-
-        self.act_1 = nn.SiLU()
-        self.act_2 = nn.ReLU()
-        self.act_3 = nn.Sigmoid()
+        self.act = nn.SiLU()
+        self.gating = ProjectionGating(C, Cp)
 
     def forward(self, x):
         x = self.bn_in(x)
 
-        x = self.pw_expand_ex(x)
+        x = self.pw_expand_ex(x) # C -> Ce
         x = self.bn1(x)
         x = self.act_1(x)
+
         x = self.dw(x)  # C = Ce
         x = self.bn2(x)
         x = self.act_1(x)
-        x = self.pw_proj_ex(x)
+
+        x = self.pw_proj_ex(x) # Ce -> C
         x = self.bn3(x)
-        short_cut = x
-        x = self.pw_proj_proj(x)
-        x = self.bn4(x)
-        x = self.act_2(x)
-        x = self.pw_expand_proj(x)
-        x = self.act_3(x)
+
+        x = self.gating(x)
         return x
