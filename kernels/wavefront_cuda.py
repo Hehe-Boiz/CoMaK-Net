@@ -1,13 +1,15 @@
 import torch
 
 from torch.utils import cpp_extension
-from definitions import ROOT_DIR
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).parent.resolve()
 
 wf_cuda = cpp_extension.load(name="wavefront_cuda",
-                             sources=[ROOT_DIR / "models/kernels/wf_cuda/wf_cuda_bind.cpp",
-                                      ROOT_DIR / "models/kernels/wf_cuda/wf_cuda.cu"],
+                             sources=[ROOT_DIR / "./wf_cuda/wf_cuda_bind.cpp",
+                                      ROOT_DIR / "./wf_cuda/wf_cuda.cu"],
                              extra_cflags=["-O2", "-fvisibility=hidden"],
-                             extra_cuda_cflags=["-Xptxas", "-O3"],
+                             extra_cuda_cflags=["-Xptxas", "-O3", "-allow-unsupported-compiler"],
                              verbose=False)
 
 class wf_cuda_fn(torch.autograd.Function):
