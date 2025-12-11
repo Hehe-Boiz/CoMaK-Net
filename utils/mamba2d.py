@@ -13,6 +13,7 @@ from .utils import StarReLU, SepConv
 torch._dynamo.config.cache_size_limit = 64
 
 
+# Before use it, need permute(0, 2, 3, 1) - Chanel last (B, H, W, C)
 class Mamba2DBlock(nn.Module):
     def __init__(self,
                  d_inner: int,
@@ -166,7 +167,7 @@ class Mamba2DBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # forward scan #
-        deltaAT, detaAL, BXT, BXL, C = self.proj_and_discretise(x)
+        deltaAT, deltaAL, BXT, BXL, C = self.proj_and_discretise(x)
 
         # selective scan with tensor.shape(B,H,W,ED,N)
         hs = wavefront_scan_cuda(deltaAT, deltaAL, BXT, BXL)
@@ -189,6 +190,9 @@ class Mamba2DBlock(nn.Module):
             # Avarage 2 direction
             y = ( y + y_b )/2
         return y
+
+
+
 class M2D(nn.Module):
     '''
         Minimal version of Mamba 2D block, adapted from base 1D implementation:
@@ -261,3 +265,59 @@ class M2D(nn.Module):
         if self.local_path:
             x = x + local_features
         return x
+
+class Mamba2DLayer(nn.Module):
+    def __init__(self, d_inner, drop_path=0.0):
+        super().__init__()
+        self.norm = nn.LayerNorm(d_inner)
+
+        self.dwconv = nn.Conv2d(
+            d_inner, d_inner,
+            kernel_size=3, stride=1, padding=1,
+            groups=d_inner, bias=False
+        )
+
+        self.act = nn.SiLU()
+        self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+
+        self.mamba = Mamba2DBlock(d_inner=d_inner, d_state=16)
+
+    def forward(self, x):
+        # x: (B,H,W,C)
+        shortcut = x
+
+        x = self.norm(x)
+
+        # BHWC → BCHW
+        x = x.permute(0,3,1,2).contiguous()
+        x = self.dwconv(x)
+        x = self.act(x)
+
+        # BCHW → BHWC
+        x = x.permute(0,2,3,1).contiguous()
+
+        x = self.mamba(x)
+
+        return shortcut + self.drop_path(x)
+
+
+# ============================================
+# 3. TEST FUNCTION — chạy thử nghiệm thật
+# ============================================
+def test():
+    B, C, H, W = 2, 64, 32, 32
+    x = torch.randn(B, H, W, C)
+
+    block = Mamba2DLayer(d_inner=C)
+
+    print("Input:", x.shape)
+    y = block(x)
+    print("Output:", y.shape)
+
+    # Backward test
+    y.mean().backward()
+    print("Backward OK — gradient exists.")
+
+
+if __name__ == "__main__":
+    test()
