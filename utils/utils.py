@@ -4,6 +4,9 @@ from functools import partial
 import math
 import torch.nn as nn
 from timm.models.layers import DropPath
+
+from utils.mamba2d import Mamba2DBlock
+
 NORM_EPS = 1e-5
 
 def merge_pre_bn(module, pre_bn_1, pre_bn_2=None):
@@ -240,6 +243,7 @@ class LocalExtractor(nn.Module):
         drop_path: float = 0.0,
         expansion_ratio: float = 0.0, # > 1
         projection_ratio: float = 0.0, # < 1
+        device: str = 'cpu',
         **kwargs,
     ):
         super().__init__()
@@ -272,7 +276,55 @@ class LocalExtractor(nn.Module):
         x = self.act_1(x)
 
         x = self.pw_proj_ex(x) # Ce -> C
-        x = self.bn3(x)
+        x = self.bn3(x) # gate voi self.gating GlobalExtractor
 
         x = self.gating(x)
         return x
+
+class GlobalExtractor(nn.Module):
+    def __init__(
+            self,
+            hidden_dim: int = 0,
+            drop_path: float = 0.0,
+            expansion_ratio: float = 0.0,  # > 1
+            projection_ratio: float = 0.0,  # < 1
+            device: str = 'cpu',
+            **kwargs,
+    ):
+        self.super().__init__()
+        C = hidden_dim
+        Ce = int(C * expansion_ratio)
+        Cp = int(C * projection_ratio)
+
+        self.norm = nn.LayerNorm(eps=NORM_EPS, device=device)
+
+        self.ln_ex = nn.Linear(in_features=C, out_features=2*Ce)
+        self.ln_proj = nn.Linear(in_features=Ce, out_features=C)
+
+        self.act  = nn.SiLU()
+
+        self.dw   = nn.Conv2d(Ce, Ce, kernel_size=3, stride=1, padding=1, groups=Ce, bias=False)
+
+        self.ssm  = Mamba2DBlock(d_inner=Ce).device(device)
+
+        self.gating = ProjectionGating(C, Cp)
+
+    def forward(self, x: nn.Tensor):
+        uv = self.ln_ex(x)  # (B,2Ce,H,W)
+        u, v = uv.chunk(2, dim=1)  # split theo channel dim=1
+
+        v = self.dw(v)  # (B,Ce,H,W)
+        v = self.act(v)
+        gate = v * self.act(u)
+
+        v = v.permute(0,2,3,1) # (B, H, W, Ce) | Ce = DE
+        v = self.ssm(v)
+        v = v.permute(0,2,3,1) # (B, Ce, H, W)
+        v = v * self.act(u)
+
+        v = v + gate
+
+        v = self.ln_proj(v) # gate voi self.gating cua LocalExtractor
+        x = self.gating(v)
+
+        return v
