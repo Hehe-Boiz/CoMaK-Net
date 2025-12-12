@@ -217,7 +217,7 @@ class SELayer(nn.Module):
         y = self.fc(y).view(b, c, 1, 1)
         return x * y
 
-
+# Channel first
 class ProjectionGating(nn.Module):
     def __init__(self, C, Cp):
         super().__init__()
@@ -236,6 +236,7 @@ class ProjectionGating(nn.Module):
         x = self.pw_expand(x)  # Cp → C
         x = self.act_gate(x)  # gating
         return x
+
 class LocalExtractor(nn.Module):
     def __init__(
         self,
@@ -265,17 +266,18 @@ class LocalExtractor(nn.Module):
         self.gating = ProjectionGating(C, Cp)
 
     def forward(self, x):
+        # Channel First
         x = self.bn_in(x)
 
-        x = self.pw_expand_ex(x) # C -> Ce
+        x = self.pw_expand(x) # C -> Ce
         x = self.bn1(x)
-        x = self.act_1(x)
+        x = self.act(x)
 
         x = self.dw(x)  # C = Ce
         x = self.bn2(x)
-        x = self.act_1(x)
+        x = self.act(x)
 
-        x = self.pw_proj_ex(x) # Ce -> C
+        x = self.pw_proj(x) # Ce -> C
         x = self.bn3(x) # gate voi self.gating GlobalExtractor
 
         x = self.gating(x)
@@ -291,12 +293,12 @@ class GlobalExtractor(nn.Module):
             device: str = 'cpu',
             **kwargs,
     ):
-        self.super().__init__()
+        super().__init__()
         C = hidden_dim
         Ce = int(C * expansion_ratio)
         Cp = int(C * projection_ratio)
 
-        self.norm = nn.LayerNorm(eps=NORM_EPS, device=device)
+        self.norm = nn.LayerNorm(normalized_shape=C, eps=NORM_EPS, device=device)
 
         self.ln_ex = nn.Linear(in_features=C, out_features=2*Ce)
         self.ln_proj = nn.Linear(in_features=Ce, out_features=C)
@@ -305,26 +307,31 @@ class GlobalExtractor(nn.Module):
 
         self.dw   = nn.Conv2d(Ce, Ce, kernel_size=3, stride=1, padding=1, groups=Ce, bias=False)
 
-        self.ssm  = Mamba2DBlock(d_inner=Ce).device(device)
+        self.ssm  = Mamba2DBlock(d_inner=Ce).to(device=device)
 
         self.gating = ProjectionGating(C, Cp)
 
     def forward(self, x: nn.Tensor):
-        uv = self.ln_ex(x)  # (B,2Ce,H,W)
-        u, v = uv.chunk(2, dim=1)  # split theo channel dim=1
+        x = x.permute(0, 2, 3, 1).contiguous() # (B, H, W, C)
 
-        v = self.dw(v)  # (B,Ce,H,W)
+        x = self.norm(x)
+        uv = self.ln_ex(x)
+        u, v = uv.chunk(2, dim=3)  # split theo channel last
+
+        g = self.act(u)
+        v = v.permute(0, 3, 1, 2).contiguous() # (B, Ce, H, W)
+        v = self.dw(v)
         v = self.act(v)
-        gate = v * self.act(u)
+        v = v.permute(0, 2, 3, 1).contiguous() # (B, H, W, Ce)
 
-        v = v.permute(0,2,3,1) # (B, H, W, Ce) | Ce = DE
+        gate = v * g # (B, H, W, Ce)
+
         v = self.ssm(v)
-        v = v.permute(0,2,3,1) # (B, Ce, H, W)
-        v = v * self.act(u)
-
+        v = v * g
         v = v + gate
 
         v = self.ln_proj(v) # gate voi self.gating cua LocalExtractor
+        v = v.permute(0, 3, 1, 2).contiguous() # (B, Ce, H, W)
         x = self.gating(v)
 
-        return v
+        return x
