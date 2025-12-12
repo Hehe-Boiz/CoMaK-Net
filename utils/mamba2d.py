@@ -3,12 +3,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from einops import rearrange
+# from einops import rearrange
 from timm.layers import DropPath
-from collections import OrderedDict
+# from collections import OrderedDict
 
 from kernels.wavefront_cuda import wavefront_scan_cuda
-from .utils import StarReLU, SepConv
+from utils import StarReLU, SepConv
 # Increase torch.compile cache size limit
 torch._dynamo.config.cache_size_limit = 64
 
@@ -139,7 +139,7 @@ class Mamba2DBlock(nn.Module):
         # B: (B,H,W,N)  
         deltaT, deltaL, B, C = torch.split(
                 delta2BC,
-                [self.dt_rank, self.dt_rank, self.dt_state, self.dt_state],
+                [self.dt_rank, self.dt_rank, self.d_state, self.d_state],
                 dim=-1,
                 )
         deltaT = F.softplus(self.dt_projT(deltaT))
@@ -306,17 +306,21 @@ class Mamba2DLayer(nn.Module):
 # ============================================
 def test():
     B, C, H, W = 2, 64, 32, 32
-    x = torch.randn(B, H, W, C)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    block = Mamba2DLayer(d_inner=C)
+    x = torch.randn(B, H, W, C, device=device)
+    block = Mamba2DLayer(d_inner=C).to(device)
 
     print("Input:", x.shape)
     y = block(x)
     print("Output:", y.shape)
 
-    # Backward test
-    y.mean().backward()
-    print("Backward OK — gradient exists.")
+    # Backward test (chỉ chạy nếu wavefront_scan_cuda có backward)
+    try:
+        y.mean().backward()
+        print("Backward OK — gradient exists.")
+    except RuntimeError as e:
+        print("Backward FAILED:", e)
 
 
 if __name__ == "__main__":
