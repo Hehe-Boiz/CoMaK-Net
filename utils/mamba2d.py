@@ -179,14 +179,11 @@ class Mamba2DBlock(nn.Module):
         
         # optioanl backward scan (bi-directional)
         if self.double_scans:
-            x_b = torch.flip(x, dim=[1,2])
+            x_b = torch.flip(x, dims=[1,2])
             deltaAT_b, deltaAL_b, BXT_b, BXL_b, C_b = self.proj_and_discretise(x_b)
-            hs_b = wavefront_scan_cuda(
-                    deltaAT_b, deltaAL_b, BXT_b, BXL_b
-                    )
+            hs_b = wavefront_scan_cuda(deltaAT_b, deltaAL_b, BXT_b, BXL_b)
             y_b = (hs_b @ C_b.unsqueeze(-1)).squeeze(-1)
             y_b = y_b + x_b * self.D.unsqueeze(0).unsqueeze(0)
-            
             # Avarage 2 direction
             y = ( y + y_b )/2
         return y

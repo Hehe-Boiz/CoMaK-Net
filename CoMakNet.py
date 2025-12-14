@@ -6,7 +6,7 @@ from natten import NeighborhoodAttention2D as NeighborhoodAttention
 from functools import partial
 from timm.models.layers import DropPath, trunc_normal_
 import torch
-from utils.utils import NORM_EPS
+from utils.utils import NORM_EPS, Mamba2DBlock
 
 is_natten_post_017 = hasattr(natten, "context")
 
@@ -153,3 +153,138 @@ class LFP(nn.Module):
         #b, d, t, _ = out.shape
         #x = x + self.mlp_path_dropout(self.kan(out.reshape(-1, out.shape[1])).reshape(b, d, t, t))
         return x
+
+class ConvGating(nn.Module):
+    def __init__(self, C, Cp):
+        super().__init__()
+        self.pw_proj = nn.Conv2d(C, Cp, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn_proj = nn.BatchNorm2d(Cp)
+
+        self.act_mid = nn.ReLU()
+
+        self.pw_expand = nn.Conv2d(Cp, C, kernel_size=1, stride=1, padding=0, bias=False)
+        self.act_gate = nn.Sigmoid()
+
+    def forward(self, x):
+        x = self.pw_proj(x)  # C → Cp
+        x = self.bn_proj(x)
+        x = self.act_mid(x)
+        x = self.pw_expand(x)  # Cp → C
+        x = self.act_gate(x)  # gating
+        return x
+
+
+class LinearGating(nn.Module):
+    def __init__(self, dim, reduction=4):
+        super().__init__()
+        reduced_dim = dim // reduction
+        self.gating = nn.Sequential(
+            nn.Linear(dim, reduced_dim, bias=False),
+            nn.LayerNorm(reduced_dim),
+            nn.SiLU(),
+            nn.Linear(reduced_dim, dim, bias=True),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # x: [B, C, H, W]
+
+        # chuyển sang Channel Last [B, H, W, C] để dùng Linear/LN
+        x_in = x.permute(0, 2, 3, 1)
+        gate = self.gating(x_in)
+
+        # trả về Channel First [B, C, H, W] để nhân
+        return gate.permute(0, 3, 1, 2)
+
+class LocalPath(nn.Module):
+    def __init__(
+        self,
+        hidden_dim: int = 0,
+        drop_path: float = 0.0,
+        expansion_ratio: float = 0.0, # > 1
+        projection_ratio: float = 0.0, # < 1
+        device: str = 'cpu',
+        **kwargs,
+    ):
+        super().__init__()
+        C = hidden_dim
+        Ce = int(C * expansion_ratio)
+        Cp = int(C * projection_ratio)
+        self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+
+        self.pw_expand   = nn.Conv2d(C, Ce, kernel_size=1, stride=1, padding=0, bias=False)
+        self.pw_proj     = nn.Conv2d(Ce, C, kernel_size=1, stride=1, padding=0, bias=False)
+        self.dw     = nn.Conv2d(Ce, Ce, kernel_size=3, stride=1, padding=1, groups=Ce, bias=False)
+
+        self.bn_in  = nn.BatchNorm2d(C)
+        self.bn1    = nn.BatchNorm2d(Ce)
+        self.bn2    = nn.BatchNorm2d(Ce)
+        self.bn3    = nn.BatchNorm2d(C)
+
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        # Channel First
+        x = self.bn_in(x)
+
+        x = self.pw_expand(x) # C -> Ce
+        x = self.bn1(x)
+        x = self.act(x)
+
+        x = self.dw(x)  # C = Ce
+        x = self.bn2(x)
+        x = self.act(x)
+
+        x = self.pw_proj(x) # Ce -> C
+        x = self.bn3(x) # gate voi self.gating GlobalExtractor
+        return x
+
+class GlobalPath(nn.Module):
+    def __init__(
+            self,
+            hidden_dim: int = 0,
+            drop_path: float = 0.0,
+            expansion_ratio: float = 0.0,  # > 1
+            projection_ratio: float = 0.0,  # < 1
+            device: str = 'cpu',
+            **kwargs,
+    ):
+        super().__init__()
+        C = hidden_dim
+        Ce = int(C * expansion_ratio)
+        Cp = int(C * projection_ratio)
+
+        self.norm = nn.LayerNorm(normalized_shape=C, eps=NORM_EPS, device=device)
+
+        self.ln_ex1 = nn.Linear(in_features=C, out_features=2*Ce)
+        self.ln_proj1 = nn.Linear(in_features=Ce, out_features=C)
+        self.act  = nn.SiLU()
+
+        self.dw   = nn.Conv2d(Ce, Ce, kernel_size=3, stride=1, padding=1, groups=Ce, bias=False)
+
+        self.ssm  = Mamba2DBlock(d_inner=Ce).to(device=device)
+
+    def forward(self, x: nn.Tensor):
+        x = x.permute(0, 2, 3, 1).contiguous() # (B, H, W, C)
+
+        x = self.norm(x)
+        uv = self.ln_ex(x)
+        u, v = uv.chunk(2, dim=3)  # split theo channel last
+
+        g = self.act(u)
+        v = v.permute(0, 3, 1, 2).contiguous() # (B, Ce, H, W)
+        v = self.dw(v)
+        v = self.act(v)
+        v = v.permute(0, 2, 3, 1).contiguous() # (B, H, W, Ce)
+
+        gate = v * g # (B, H, W, Ce)
+
+        v = self.ssm(v)
+        v = v * g
+        v = v + gate
+
+        v = self.ln_proj(v) # gate voi self.gating cua LocalExtractor
+        v = v.permute(0, 3, 1, 2).contiguous() # (B, Ce, H, W)
+
+        return x
+
