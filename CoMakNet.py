@@ -201,15 +201,13 @@ class LocalPath(nn.Module):
         self,
         hidden_dim: int = 0,
         drop_path: float = 0.0,
-        expansion_ratio: float = 0.0, # > 1
-        projection_ratio: float = 0.0, # < 1
-        device: str = 'cpu',
+        expansion_ratio: int = 1, # > 1
+        device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
         **kwargs,
     ):
         super().__init__()
         C = hidden_dim
-        Ce = int(C * expansion_ratio)
-        Cp = int(C * projection_ratio)
+        Ce = C * expansion_ratio
         self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
 
         self.pw_expand   = nn.Conv2d(C, Ce, kernel_size=1, stride=1, padding=0, bias=False)
@@ -239,20 +237,21 @@ class LocalPath(nn.Module):
         x = self.bn3(x) # gate voi self.gating GlobalExtractor
         return x
 
+def r_silu(x):
+    return x * torch.sigmoid(-x)
+
 class GlobalPath(nn.Module):
     def __init__(
             self,
             hidden_dim: int = 0,
             drop_path: float = 0.0,
-            expansion_ratio: float = 0.0,  # > 1
-            projection_ratio: float = 0.0,  # < 1
-            device: str = 'cpu',
+            expansion_ratio: int = 1,  # > 1
+            device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
             **kwargs,
     ):
         super().__init__()
         C = hidden_dim
         Ce = int(C * expansion_ratio)
-        Cp = int(C * projection_ratio)
 
         self.norm = nn.LayerNorm(normalized_shape=C, eps=NORM_EPS, device=device)
 
@@ -277,7 +276,7 @@ class GlobalPath(nn.Module):
         v = self.act(v)
         v = v.permute(0, 2, 3, 1).contiguous() # (B, H, W, Ce)
 
-        gate = v * g # (B, H, W, Ce)
+        gate = r_silu(v) # (B, H, W, Ce)
 
         v = self.ssm(v)
         v = v * g
