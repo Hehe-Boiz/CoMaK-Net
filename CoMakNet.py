@@ -177,7 +177,7 @@ class ConvGating(nn.Module):
 class LinearGating(nn.Module):
     def __init__(self, dim, reduction=4):
         super().__init__()
-        reduced_dim = dim // reduction
+        reduced_dim = max(dim // reduction, 1)
         self.gating = nn.Sequential(
             nn.Linear(dim, reduced_dim, bias=False),
             nn.LayerNorm(reduced_dim),
@@ -200,15 +200,12 @@ class LocalPath(nn.Module):
     def __init__(
         self,
         hidden_dim: int = 0,
-        drop_path: float = 0.0,
         expansion_ratio: int = 1, # > 1
-        device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
         **kwargs,
     ):
         super().__init__()
         C = hidden_dim
         Ce = C * expansion_ratio
-        self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
 
         self.pw_expand   = nn.Conv2d(C, Ce, kernel_size=1, stride=1, padding=0, bias=False)
         self.pw_proj     = nn.Conv2d(Ce, C, kernel_size=1, stride=1, padding=0, bias=False)
@@ -244,7 +241,6 @@ class GlobalPath(nn.Module):
     def __init__(
             self,
             hidden_dim: int = 0,
-            drop_path: float = 0.0,
             expansion_ratio: int = 1,  # > 1
             device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
             **kwargs,
@@ -253,15 +249,15 @@ class GlobalPath(nn.Module):
         C = hidden_dim
         Ce = int(C * expansion_ratio)
 
-        self.norm = nn.LayerNorm(normalized_shape=C, eps=NORM_EPS, device=device)
+        self.norm = nn.LayerNorm(normalized_shape=C, eps=NORM_EPS)
 
-        self.ln_ex1 = nn.Linear(in_features=C, out_features=2*Ce)
-        self.ln_proj1 = nn.Linear(in_features=Ce, out_features=C)
+        self.ln_ex = nn.Linear(in_features=C, out_features=2*Ce)
+        self.ln_proj = nn.Linear(in_features=Ce, out_features=C)
         self.act  = nn.SiLU()
 
         self.dw   = nn.Conv2d(Ce, Ce, kernel_size=3, stride=1, padding=1, groups=Ce, bias=False)
 
-        self.ssm  = Mamba2DBlock(d_inner=Ce).to(device=device)
+        self.ssm  = Mamba2DBlock(d_inner=Ce).to(device)
 
     def forward(self, x: nn.Tensor):
         x = x.permute(0, 2, 3, 1).contiguous() # (B, H, W, C)
@@ -270,13 +266,15 @@ class GlobalPath(nn.Module):
         uv = self.ln_ex(x)
         u, v = uv.chunk(2, dim=3)  # split theo channel last
 
+        gate = r_silu(u)  # (B, H, W, Ce)
+
         g = self.act(u)
         v = v.permute(0, 3, 1, 2).contiguous() # (B, Ce, H, W)
         v = self.dw(v)
         v = self.act(v)
         v = v.permute(0, 2, 3, 1).contiguous() # (B, H, W, Ce)
 
-        gate = r_silu(v) # (B, H, W, Ce)
+        gate = v * gate
 
         v = self.ssm(v)
         v = v * g
@@ -285,5 +283,40 @@ class GlobalPath(nn.Module):
         v = self.ln_proj(v) # gate voi self.gating cua LocalExtractor
         v = v.permute(0, 3, 1, 2).contiguous() # (B, Ce, H, W)
 
-        return x
+        return v
 
+class EnhancedMamba2DBlock(nn.Module):
+    def __init__(
+            self,
+            hidden_dim: int = 0,
+            expansion_ratio_local: int = 1,
+            expansion_ratio_global: int = 1,
+            contraction_ratio_gating: int = 1,
+            drop_path: float = 0.0,
+            **kwargs,
+    ):
+        super().__init__()
+        self.norm = nn.BatchNorm2d(hidden_dim)
+        self.global_path = GlobalPath(hidden_dim=hidden_dim, expansion_ratio=expansion_ratio_global)
+        self.local_path = LocalPath(hidden_dim=hidden_dim, expansion_ratio=expansion_ratio_local)
+
+        self.gating_local = LinearGating(dim=hidden_dim, reduction=contraction_ratio_gating)
+        self.gating_global = LinearGating(dim=hidden_dim, reduction=contraction_ratio_gating)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+    def forward(self, x):
+        shortcut = x
+
+        global_path = self.global_path(x)
+        local_path = self.local_path(x)
+
+        # cross gating
+        gating_for_global = self.gating_local(local_path)
+        gating_for_local = self.gating_global(global_path)
+
+        x_fused = global_path * gating_for_global + local_path * gating_for_local
+
+        # Residual Connection
+        # Norm -> DropPath -> Add Shortcut
+        x_out = shortcut + self.drop_path(self.norm(x_fused))
+        return x_out
