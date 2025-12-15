@@ -1,14 +1,68 @@
 from torch.nn import functional as F
 from torch import nn
-from utils.utils import h_swish, _make_divisible, SELayer, ECALayer, merge_pre_bn, PatchEmbed
+from utils.utils import h_swish, _make_divisible, SELayer, ECALayer, merge_pre_bn
 import natten
 from natten import NeighborhoodAttention2D as NeighborhoodAttention
 from functools import partial
 from timm.models.layers import DropPath, trunc_normal_
 import torch
-from utils.utils import NORM_EPS, Mamba2DBlock
+from utils.mamba2d import Mamba2DBlock
+from einops import rearrange
+from utils.fasterkan import FasterKAN as KAN
 
+
+
+NORM_EPS = 1e-5
 is_natten_post_017 = hasattr(natten, "context")
+
+class ConvBNReLU(nn.Module):
+    def __init__(
+            self,
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            groups=1):
+        super(ConvBNReLU, self).__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=1,
+                groups=groups,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels, eps=NORM_EPS),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+class PatchEmbed(nn.Module):
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 stride=1):
+        super(PatchEmbed, self).__init__()
+        norm_layer = partial(nn.BatchNorm2d, eps=NORM_EPS)
+        if stride == 2:
+            self.avgpool = nn.AvgPool2d((2, 2), stride=2, ceil_mode=True, count_include_pad=False)
+            self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, bias=False)
+            self.norm = norm_layer(out_channels)
+        elif in_channels != out_channels:
+            self.avgpool = nn.Identity()
+            self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, bias=False)
+            self.norm = norm_layer(out_channels)
+        else:
+            self.avgpool = nn.Identity()
+            self.conv = nn.Identity()
+            self.norm = nn.Identity()
+
+    def forward(self, x):
+        return self.norm(self.conv(self.avgpool(x)))
 
 class LocalityFeedForward(nn.Module):
     def __init__(self, in_dim=64, out_dim=96, kernel_size=3, stride=1, expand_ratio=4., act='hs+se', reduction=4,
@@ -319,4 +373,48 @@ class EnhancedMamba2DBlock(nn.Module):
         # Residual Connection
         # Norm -> DropPath -> Add Shortcut
         x_out = shortcut + self.drop_path(self.norm(x_fused))
+
         return x_out
+
+class GFP(nn.Module):
+    """
+    Local Transformer Block
+    """
+    def __init__(
+            self,
+            in_channels,
+            out_channels,
+            path_dropout,
+            expansion_ratio_local: int = 1,
+            expansion_ratio_global: int=1,
+            contraction_ratio_gating: int=1,
+            mlp_ratio=2,
+            stride=1,
+            **kwargs,
+    ):
+        super(GFP, self).__init__()
+        if in_channels != out_channels or stride > 1:
+            self.proj = PatchEmbed(in_channels, out_channels, stride)
+        else:
+            self.proj = nn.Identity()
+        self.in_channels = in_channels
+        dim = out_channels
+
+        self.mamba_block = EnhancedMamba2DBlock(hidden_dim=dim,
+                                                expansion_ratio_local=expansion_ratio_local,
+                                                expansion_ratio_global=expansion_ratio_global,
+                                                contraction_ratio_gating=contraction_ratio_gating,
+                                                drop_path=path_dropout,)
+
+        self.mlp_path_dropout = DropPath(path_dropout)
+        hidden_dim = int(out_channels * mlp_ratio)
+        self.kan = KAN([out_channels, hidden_dim, out_channels])
+
+    def forward(self, x):
+        x = self.proj(x)
+        out = self.mamba_block(x)
+        B, C, H, W = x.shape
+        b, d, t, _ = out.shape
+        x = out + self.mlp_path_dropout(self.kan(out.reshape(-1, out.shape[1])).reshape(b, d, t, t))
+        return x
+
