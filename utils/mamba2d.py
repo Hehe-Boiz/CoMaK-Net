@@ -8,7 +8,7 @@ from timm.layers import DropPath
 # from collections import OrderedDict
 
 from kernels.wavefront_cuda import wavefront_scan_cuda
-from utils import StarReLU, SepConv
+from .utils import StarReLU, SepConv
 # Increase torch.compile cache size limit
 torch._dynamo.config.cache_size_limit = 64
 

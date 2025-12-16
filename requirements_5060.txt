@@ -1,0 +1,35 @@
+# --- Core Deep Learning Framework ---
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.9.0
+torchvision==0.24.0
+torchaudio==2.9.0
+torchsummary
+
+# --- Computer Vision & Models ---
+timm
+einops
+grad-cam
+-f https://whl.natten.org
+natten==0.21.1+torch290cu128
+#mamba-ssm
+
+# --- Data Processing & Augmentation ---
+numpy
+pandas
+scikit-learn
+scikit-image
+Pillow
+medmnist==3.0.2
+torchattacks
+
+# --- Utilities & Visualization ---
+fvcore
+tqdm
+fire
+ninja
+pybind11
+wandb
+omegaconf
+jsonargparse[signatures]
+pathlib2
+schedulefree
