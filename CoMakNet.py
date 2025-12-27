@@ -1,28 +1,25 @@
-from torch.nn import functional as F
-from torch import nn
-from utils.utils import h_swish, _make_divisible, SELayer, ECALayer, merge_pre_bn
-import natten
-from natten import NeighborhoodAttention2D as NeighborhoodAttention
 from functools import partial
-from timm.models.layers import DropPath, trunc_normal_
-import torch
-from utils.mamba2d import Mamba2DBlock
-from einops import rearrange
-from utils.fasterkan import FasterKAN as KAN
-import torch.utils.checkpoint as checkpoint
 
+import natten
+import torch
+import torch.utils.checkpoint as checkpoint
+from einops import rearrange
+from natten import NeighborhoodAttention2D as NeighborhoodAttention
+from timm.models.layers import DropPath, trunc_normal_
+from torch import nn
+from torch.nn import functional as F
+
+from utils.fasterkan import FasterKAN as KAN
+from utils.mamba2 import Mamba2
+from utils.mamba2d import Mamba2DBlock
+from utils.utils import ECALayer, SELayer, _make_divisible, h_swish, merge_pre_bn
 
 NORM_EPS = 1e-5
 is_natten_post_017 = hasattr(natten, "context")
 
+
 class ConvBNReLU(nn.Module):
-    def __init__(
-            self,
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride,
-            groups=1):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, groups=1):
         super(ConvBNReLU, self).__init__()
         self.block = nn.Sequential(
             nn.Conv2d(
@@ -41,20 +38,24 @@ class ConvBNReLU(nn.Module):
     def forward(self, x):
         return self.block(x)
 
+
 class PatchEmbed(nn.Module):
-    def __init__(self,
-                 in_channels,
-                 out_channels,
-                 stride=1):
+    def __init__(self, in_channels, out_channels, stride=1):
         super(PatchEmbed, self).__init__()
         norm_layer = partial(nn.BatchNorm2d, eps=NORM_EPS)
         if stride == 2:
-            self.avgpool = nn.AvgPool2d((2, 2), stride=2, ceil_mode=True, count_include_pad=False)
-            self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, bias=False)
+            self.avgpool = nn.AvgPool2d(
+                (2, 2), stride=2, ceil_mode=True, count_include_pad=False
+            )
+            self.conv = nn.Conv2d(
+                in_channels, out_channels, kernel_size=1, stride=1, bias=False
+            )
             self.norm = norm_layer(out_channels)
         elif in_channels != out_channels:
             self.avgpool = nn.Identity()
-            self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, bias=False)
+            self.conv = nn.Conv2d(
+                in_channels, out_channels, kernel_size=1, stride=1, bias=False
+            )
             self.norm = norm_layer(out_channels)
         else:
             self.avgpool = nn.Identity()
@@ -64,9 +65,20 @@ class PatchEmbed(nn.Module):
     def forward(self, x):
         return self.norm(self.conv(self.avgpool(x)))
 
+
 class LocalityFeedForward(nn.Module):
-    def __init__(self, in_dim=64, out_dim=96, kernel_size=3, stride=1, expand_ratio=4., act='hs+se', reduction=4,
-                 wo_dp_conv=False, dp_first=False):
+    def __init__(
+        self,
+        in_dim=64,
+        out_dim=96,
+        kernel_size=3,
+        stride=1,
+        expand_ratio=4.0,
+        act="hs+se",
+        reduction=4,
+        wo_dp_conv=False,
+        dp_first=False,
+    ):
         """
         :param in_dim: the input dimension
         :param out_dim: the output dimension. The input and output dimension should be the same.
@@ -85,40 +97,54 @@ class LocalityFeedForward(nn.Module):
         super(LocalityFeedForward, self).__init__()
         hidden_dim = int(in_dim * expand_ratio)
 
-
         layers = []
         # the first linear layer is replaced by 1x1 convolution.
-        layers.extend([
-            nn.Conv2d(in_dim, hidden_dim, 1, 1, 0, bias=False),
-            nn.BatchNorm2d(hidden_dim),
-            h_swish() if act.find('hs') >= 0 else nn.ReLU6(inplace=True)])
+        layers.extend(
+            [
+                nn.Conv2d(in_dim, hidden_dim, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                h_swish() if act.find("hs") >= 0 else nn.ReLU6(inplace=True),
+            ]
+        )
 
         # the depth-wise convolution between the two linear layers
         if not wo_dp_conv:
             dp = [
-                nn.Conv2d(hidden_dim, hidden_dim, kernel_size= kernel_size, stride= stride, padding= kernel_size // 2, groups=hidden_dim, bias=False),
+                nn.Conv2d(
+                    hidden_dim,
+                    hidden_dim,
+                    kernel_size=kernel_size,
+                    stride=stride,
+                    padding=kernel_size // 2,
+                    groups=hidden_dim,
+                    bias=False,
+                ),
                 nn.BatchNorm2d(hidden_dim),
-                h_swish() if act.find('hs') >= 0 else nn.ReLU6(inplace=True)
+                h_swish() if act.find("hs") >= 0 else nn.ReLU6(inplace=True),
             ]
             if dp_first:
                 layers = dp + layers
             else:
                 layers.extend(dp)
 
-        if act.find('+') >= 0:
-            attn = act.split('+')[1]
-            if attn == 'se':
+        if act.find("+") >= 0:
+            attn = act.split("+")[1]
+            if attn == "se":
                 layers.append(SELayer(hidden_dim, reduction=reduction))
-            elif attn.find('eca') >= 0:
-                layers.append(ECALayer(hidden_dim, sigmoid=attn == 'eca'))
+            elif attn.find("eca") >= 0:
+                layers.append(ECALayer(hidden_dim, sigmoid=attn == "eca"))
             else:
-                raise NotImplementedError('Activation type {} is not implemented'.format(act))
+                raise NotImplementedError(
+                    "Activation type {} is not implemented".format(act)
+                )
 
         # the second linear layer is replaced by 1x1 convolution.
-        layers.extend([
-            nn.Conv2d(hidden_dim, out_dim, 1, 1, 0, bias=False),
-            nn.BatchNorm2d(out_dim)
-        ])
+        layers.extend(
+            [
+                nn.Conv2d(hidden_dim, out_dim, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(out_dim),
+            ]
+        )
         self.conv = nn.Sequential(*layers)
 
     def forward(self, x):
@@ -127,7 +153,9 @@ class LocalityFeedForward(nn.Module):
 
 
 class Mlp(nn.Module):
-    def __init__(self, in_features, out_features=None, mlp_ratio=None, drop=0., bias=True):
+    def __init__(
+        self, in_features, out_features=None, mlp_ratio=None, drop=0.0, bias=True
+    ):
         super().__init__()
         out_features = out_features or in_features
         hidden_dim = _make_divisible(in_features * mlp_ratio, 32)
@@ -152,8 +180,18 @@ class LFP(nn.Module):
     """
     Efficient Convolution Block
     """
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, path_dropout=0.2,
-                 drop=0, head_dim=32, mlp_ratio=3):
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=3,
+        stride=1,
+        path_dropout=0.2,
+        drop=0,
+        head_dim=32,
+        mlp_ratio=3,
+    ):
         super(LFP, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -161,14 +199,14 @@ class LFP(nn.Module):
         assert out_channels % head_dim == 0
 
         self.patch_embed = PatchEmbed(in_channels, out_channels, stride)
-        #self.mhca = MHCA(out_channels, head_dim)
+        # self.mhca = MHCA(out_channels, head_dim)
         self.norm1 = norm_layer(out_channels)
         extra_args = {"rel_pos_bias": True} if is_natten_post_017 else {"bias": True}
         self.attn = NeighborhoodAttention(
             out_channels,
             kernel_size=7,
             dilation=None,
-            num_heads= (out_channels // head_dim),
+            num_heads=(out_channels // head_dim),
             qkv_bias=True,
             qk_scale=None,
             attn_drop=drop,
@@ -177,13 +215,20 @@ class LFP(nn.Module):
         )
         self.attention_path_dropout = DropPath(path_dropout)
 
-        self.conv = LocalityFeedForward(out_channels, out_channels, kernel_size, 1, mlp_ratio, reduction=out_channels)
+        self.conv = LocalityFeedForward(
+            out_channels,
+            out_channels,
+            kernel_size,
+            1,
+            mlp_ratio,
+            reduction=out_channels,
+        )
 
         self.norm2 = norm_layer(out_channels)
-        #self.mlp = Mlp(out_channels, mlp_ratio=mlp_ratio, drop=drop, bias=True)
-        #self.mlp_path_dropout = DropPath(path_dropout)
-        #hidden_dim = int(out_channels * mlp_ratio)
-        #self.kan = KAN([out_channels, hidden_dim, out_channels])
+        # self.mlp = Mlp(out_channels, mlp_ratio=mlp_ratio, drop=drop, bias=True)
+        # self.mlp_path_dropout = DropPath(path_dropout)
+        # hidden_dim = int(out_channels * mlp_ratio)
+        # self.kan = KAN([out_channels, hidden_dim, out_channels])
         self.is_bn_merged = False
 
     def merge_bn(self):
@@ -202,11 +247,12 @@ class LFP(nn.Module):
             out = self.norm2(x)
         else:
             out = x
-        #x = x + self.mlp_path_dropout(self.mlp(out))
-        x = x + self.conv(out) # (B, dim, 14, 14)
-        #b, d, t, _ = out.shape
-        #x = x + self.mlp_path_dropout(self.kan(out.reshape(-1, out.shape[1])).reshape(b, d, t, t))
+        # x = x + self.mlp_path_dropout(self.mlp(out))
+        x = x + self.conv(out)  # (B, dim, 14, 14)
+        # b, d, t, _ = out.shape
+        # x = x + self.mlp_path_dropout(self.kan(out.reshape(-1, out.shape[1])).reshape(b, d, t, t))
         return x
+
 
 class ConvGating(nn.Module):
     def __init__(self, C, Cp):
@@ -216,7 +262,9 @@ class ConvGating(nn.Module):
 
         self.act_mid = nn.ReLU()
 
-        self.pw_expand = nn.Conv2d(Cp, C, kernel_size=1, stride=1, padding=0, bias=False)
+        self.pw_expand = nn.Conv2d(
+            Cp, C, kernel_size=1, stride=1, padding=0, bias=False
+        )
         self.act_gate = nn.Sigmoid()
 
     def forward(self, x):
@@ -237,7 +285,7 @@ class LinearGating(nn.Module):
             nn.LayerNorm(reduced_dim),
             nn.SiLU(),
             nn.Linear(reduced_dim, dim, bias=True),
-            nn.Sigmoid()
+            nn.Sigmoid(),
         )
 
     def forward(self, x):
@@ -250,25 +298,30 @@ class LinearGating(nn.Module):
         # trả về Channel First [B, C, H, W] để nhân
         return gate.permute(0, 3, 1, 2)
 
+
 class LocalPath(nn.Module):
     def __init__(
         self,
         hidden_dim: int = 0,
-        expansion_ratio: int = 1, # > 1
+        expansion_ratio: int = 1,  # > 1
         **kwargs,
     ):
         super().__init__()
         C = hidden_dim
         Ce = C * expansion_ratio
 
-        self.pw_expand   = nn.Conv2d(C, Ce, kernel_size=1, stride=1, padding=0, bias=False)
-        self.pw_proj     = nn.Conv2d(Ce, C, kernel_size=1, stride=1, padding=0, bias=False)
-        self.dw     = nn.Conv2d(Ce, Ce, kernel_size=3, stride=1, padding=1, groups=Ce, bias=False)
+        self.pw_expand = nn.Conv2d(
+            C, Ce, kernel_size=1, stride=1, padding=0, bias=False
+        )
+        self.pw_proj = nn.Conv2d(Ce, C, kernel_size=1, stride=1, padding=0, bias=False)
+        self.dw = nn.Conv2d(
+            Ce, Ce, kernel_size=3, stride=1, padding=1, groups=Ce, bias=False
+        )
 
-        self.bn_in  = nn.BatchNorm2d(C)
-        self.bn1    = nn.BatchNorm2d(Ce)
-        self.bn2    = nn.BatchNorm2d(Ce)
-        self.bn3    = nn.BatchNorm2d(C)
+        self.bn_in = nn.BatchNorm2d(C)
+        self.bn1 = nn.BatchNorm2d(Ce)
+        self.bn2 = nn.BatchNorm2d(Ce)
+        self.bn3 = nn.BatchNorm2d(C)
 
         self.act = nn.SiLU()
 
@@ -276,7 +329,7 @@ class LocalPath(nn.Module):
         # Channel First
         x = self.bn_in(x)
 
-        x = self.pw_expand(x) # C -> Ce
+        x = self.pw_expand(x)  # C -> Ce
         x = self.bn1(x)
         x = self.act(x)
 
@@ -284,20 +337,22 @@ class LocalPath(nn.Module):
         x = self.bn2(x)
         x = self.act(x)
 
-        x = self.pw_proj(x) # Ce -> C
-        x = self.bn3(x) # gate voi self.gating GlobalExtractor
+        x = self.pw_proj(x)  # Ce -> C
+        x = self.bn3(x)  # gate voi self.gating GlobalExtractor
         return x
+
 
 def r_silu(x):
     return x * torch.sigmoid(-x)
 
+
 class GlobalPath(nn.Module):
     def __init__(
-            self,
-            hidden_dim: int = 0,
-            expansion_ratio: int = 1,  # > 1
-            device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
-            **kwargs,
+        self,
+        hidden_dim: int = 0,
+        expansion_ratio: int = 1,  # > 1
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        **kwargs,
     ):
         super().__init__()
         C = hidden_dim
@@ -305,16 +360,21 @@ class GlobalPath(nn.Module):
 
         self.norm = nn.LayerNorm(normalized_shape=C, eps=NORM_EPS)
 
-        self.ln_ex = nn.Linear(in_features=C, out_features=2*Ce)
+        self.ln_ex = nn.Linear(in_features=C, out_features=2 * Ce)
         self.ln_proj = nn.Linear(in_features=Ce, out_features=C)
-        self.act  = nn.SiLU()
+        self.act = nn.SiLU()
 
-        self.dw   = nn.Conv2d(Ce, Ce, kernel_size=3, stride=1, padding=1, groups=Ce, bias=False)
+        self.dw = nn.Conv2d(
+            Ce, Ce, kernel_size=3, stride=1, padding=1, groups=Ce, bias=False
+        )
 
-        self.ssm  = Mamba2DBlock(d_inner=Ce).to(device)
+        # self.ssm = Mamba2DBlock(d_inner=Ce).to(device)
+
+        # expand chỉnh về 1 để tránh expand thêm 1 lần nữa trong logic Mamba2
+        self.ssm = Mamba2(d_model=Ce, expand=1, headdim=32)
 
     def forward(self, x: nn.Tensor):
-        x = x.permute(0, 2, 3, 1).contiguous() # (B, H, W, C)
+        x = x.permute(0, 2, 3, 1).contiguous()  # (B, H, W, C)
 
         x = self.norm(x)
         uv = self.ln_ex(x)
@@ -323,10 +383,10 @@ class GlobalPath(nn.Module):
         gate = r_silu(u)  # (B, H, W, Ce)
 
         g = self.act(u)
-        v = v.permute(0, 3, 1, 2).contiguous() # (B, Ce, H, W)
+        v = v.permute(0, 3, 1, 2).contiguous()  # (B, Ce, H, W)
         v = self.dw(v)
         v = self.act(v)
-        v = v.permute(0, 2, 3, 1).contiguous() # (B, H, W, Ce)
+        v = v.permute(0, 2, 3, 1).contiguous()  # (B, H, W, Ce)
 
         gate = v * gate
 
@@ -334,29 +394,38 @@ class GlobalPath(nn.Module):
         v = v * g
         v = v + gate
 
-        v = self.ln_proj(v) # gate voi self.gating cua LocalExtractor
-        v = v.permute(0, 3, 1, 2).contiguous() # (B, Ce, H, W)
+        v = self.ln_proj(v)  # gate voi self.gating cua LocalExtractor
+        v = v.permute(0, 3, 1, 2).contiguous()  # (B, Ce, H, W)
 
         return v
 
+
 class EnhancedMamba2DBlock(nn.Module):
     def __init__(
-            self,
-            hidden_dim: int = 0,
-            expansion_ratio_local: int = 1,
-            expansion_ratio_global: int = 1,
-            contraction_ratio_gating: int = 1,
-            drop_path: float = 0.0,
-            **kwargs,
+        self,
+        hidden_dim: int = 0,
+        expansion_ratio_local: int = 1,
+        expansion_ratio_global: int = 1,
+        contraction_ratio_gating: int = 1,
+        drop_path: float = 0.0,
+        **kwargs,
     ):
         super().__init__()
         self.norm = nn.BatchNorm2d(hidden_dim)
-        self.global_path = GlobalPath(hidden_dim=hidden_dim, expansion_ratio=expansion_ratio_global)
-        self.local_path = LocalPath(hidden_dim=hidden_dim, expansion_ratio=expansion_ratio_local)
+        self.global_path = GlobalPath(
+            hidden_dim=hidden_dim, expansion_ratio=expansion_ratio_global
+        )
+        self.local_path = LocalPath(
+            hidden_dim=hidden_dim, expansion_ratio=expansion_ratio_local
+        )
 
-        self.gating_local = LinearGating(dim=hidden_dim, reduction=contraction_ratio_gating)
-        self.gating_global = LinearGating(dim=hidden_dim, reduction=contraction_ratio_gating)
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.gating_local = LinearGating(
+            dim=hidden_dim, reduction=contraction_ratio_gating
+        )
+        self.gating_global = LinearGating(
+            dim=hidden_dim, reduction=contraction_ratio_gating
+        )
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(self, x):
         shortcut = x
@@ -376,21 +445,23 @@ class EnhancedMamba2DBlock(nn.Module):
 
         return x_out
 
+
 class GFP(nn.Module):
     """
     Local Transformer Block
     """
+
     def __init__(
-            self,
-            in_channels,
-            out_channels,
-            path_dropout,
-            expansion_ratio_local: int = 1,
-            expansion_ratio_global: int=1,
-            contraction_ratio_gating: int=1,
-            mlp_ratio=2,
-            stride=1,
-            **kwargs,
+        self,
+        in_channels,
+        out_channels,
+        path_dropout,
+        expansion_ratio_local: int = 1,
+        expansion_ratio_global: int = 1,
+        contraction_ratio_gating: int = 1,
+        mlp_ratio=2,
+        stride=1,
+        **kwargs,
     ):
         super(GFP, self).__init__()
         if in_channels != out_channels or stride > 1:
@@ -400,11 +471,13 @@ class GFP(nn.Module):
         self.in_channels = in_channels
         dim = out_channels
 
-        self.mamba_block = EnhancedMamba2DBlock(hidden_dim=dim,
-                                                expansion_ratio_local=expansion_ratio_local,
-                                                expansion_ratio_global=expansion_ratio_global,
-                                                contraction_ratio_gating=contraction_ratio_gating,
-                                                drop_path=path_dropout,)
+        self.mamba_block = EnhancedMamba2DBlock(
+            hidden_dim=dim,
+            expansion_ratio_local=expansion_ratio_local,
+            expansion_ratio_global=expansion_ratio_global,
+            contraction_ratio_gating=contraction_ratio_gating,
+            drop_path=path_dropout,
+        )
 
         self.mlp_path_dropout = DropPath(path_dropout)
         hidden_dim = int(out_channels * mlp_ratio)
@@ -415,28 +488,45 @@ class GFP(nn.Module):
         out = self.mamba_block(x)
         B, C, H, W = x.shape
         b, d, t, _ = out.shape
-        x = out + self.mlp_path_dropout(self.kan(out.reshape(-1, out.shape[1])).reshape(b, d, t, t))
+        x = out + self.mlp_path_dropout(
+            self.kan(out.reshape(-1, out.shape[1])).reshape(b, d, t, t)
+        )
         return x
 
+
 class CoMakNet(nn.Module):
-    def __init__(self, stem_chs=[64, 32, 64], depths=[2, 2, 6, 2],
-                 dims=[64, 128, 320, 512], path_dropout=0.1, attn_drop=0,
-                 drop=0, num_classes=1000,
-                 strides=[1, 2, 2, 2], sr_ratios=[8, 4, 2, 1], head_dim=32, mix_block_ratio=0.75,
-                 use_checkpoint=False):
+    def __init__(
+        self,
+        stem_chs=[64, 32, 64],
+        depths=[2, 2, 6, 2],
+        dims=[64, 128, 320, 512],
+        path_dropout=0.1,
+        attn_drop=0,
+        drop=0,
+        num_classes=1000,
+        strides=[1, 2, 2, 2],
+        sr_ratios=[8, 4, 2, 1],
+        head_dim=32,
+        mix_block_ratio=0.75,
+        use_checkpoint=False,
+    ):
         super(CoMakNet, self).__init__()
         self.use_checkpoint = use_checkpoint
 
-        self.stage_out_channels = [[dims[0]] * (depths[0]),
-                                   [dims[1]] * (depths[1] - 1) + [dims[1]],
-                                   [dims[2], dims[2], dims[2]] * (depths[2] // 3),
-                                   [dims[3]] * (depths[3])]
+        self.stage_out_channels = [
+            [dims[0]] * (depths[0]),
+            [dims[1]] * (depths[1] - 1) + [dims[1]],
+            [dims[2], dims[2], dims[2]] * (depths[2] // 3),
+            [dims[3]] * (depths[3]),
+        ]
 
         # Next Hybrid Strategy
-        self.stage_block_types = [[LFP] * depths[0],
-                                  [LFP] * (depths[1] - 1) + [GFP],
-                                  [LFP, LFP, GFP] * (depths[2] // 3),
-                                  [GFP] * (depths[3])]
+        self.stage_block_types = [
+            [LFP] * depths[0],
+            [LFP] * (depths[1] - 1) + [GFP],
+            [LFP, LFP, GFP] * (depths[2] // 3),
+            [GFP] * (depths[3]),
+        ]
 
         self.stem = nn.Sequential(
             ConvBNReLU(3, stem_chs[0], kernel_size=3, stride=2),
@@ -447,9 +537,11 @@ class CoMakNet(nn.Module):
         input_channel = stem_chs[-1]
         features = []
         idx = 0
-        dpr = [x.item() for x in torch.linspace(0, path_dropout, sum(depths))]  # stochastic depth decay rule
+        dpr = [
+            x.item() for x in torch.linspace(0, path_dropout, sum(depths))
+        ]  # stochastic depth decay rule
         for stage_id in range(len(depths)):
-            kernel=7 if stage_id == 0 else 3
+            kernel = 7 if stage_id == 0 else 3
             numrepeat = depths[stage_id]
             output_channels = self.stage_out_channels[stage_id]
             block_types = self.stage_block_types[stage_id]
@@ -461,13 +553,28 @@ class CoMakNet(nn.Module):
                 output_channel = output_channels[block_id]
                 block_type = block_types[block_id]
                 if block_type is LFP:
-                    layer = LFP(input_channel, output_channel, stride=stride, kernel_size=kernel, path_dropout=dpr[idx + block_id],
-                                drop=drop, head_dim=head_dim)
+                    layer = LFP(
+                        input_channel,
+                        output_channel,
+                        stride=stride,
+                        kernel_size=kernel,
+                        path_dropout=dpr[idx + block_id],
+                        drop=drop,
+                        head_dim=head_dim,
+                    )
                     features.append(layer)
                 elif block_type is GFP:
-                    layer = GFP(input_channel, output_channel, path_dropout=dpr[idx + block_id], stride=stride,
-                                sr_ratio=sr_ratios[stage_id], head_dim=head_dim, mix_block_ratio=mix_block_ratio,
-                                attn_drop=attn_drop, drop=drop)
+                    layer = GFP(
+                        input_channel,
+                        output_channel,
+                        path_dropout=dpr[idx + block_id],
+                        stride=stride,
+                        sr_ratio=sr_ratios[stage_id],
+                        head_dim=head_dim,
+                        mix_block_ratio=mix_block_ratio,
+                        attn_drop=attn_drop,
+                        drop=drop,
+                    )
                     features.append(layer)
                 input_channel = output_channel
             idx += numrepeat
@@ -480,22 +587,24 @@ class CoMakNet(nn.Module):
             nn.Linear(output_channel, num_classes),
         )
 
-        self.stage_out_idx = [sum(depths[:idx + 1]) - 1 for idx in range(len(depths))]
-        print('initialize_weights...')
+        self.stage_out_idx = [sum(depths[: idx + 1]) - 1 for idx in range(len(depths))]
+        print("initialize_weights...")
         self._initialize_weights()
 
     def _initialize_weights(self):
         for n, m in self.named_modules():
-            if isinstance(m, (nn.BatchNorm2d, nn.GroupNorm, nn.LayerNorm, nn.BatchNorm1d)):
+            if isinstance(
+                m, (nn.BatchNorm2d, nn.GroupNorm, nn.LayerNorm, nn.BatchNorm1d)
+            ):
                 nn.init.constant_(m.weight, 1.0)
                 nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.Linear):
-                trunc_normal_(m.weight, std=.02)
-                if hasattr(m, 'bias') and m.bias is not None:
+                trunc_normal_(m.weight, std=0.02)
+                if hasattr(m, "bias") and m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.Conv2d):
-                trunc_normal_(m.weight, std=.02)
-                if hasattr(m, 'bias') and m.bias is not None:
+                trunc_normal_(m.weight, std=0.02)
+                if hasattr(m, "bias") and m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
@@ -511,9 +620,15 @@ class CoMakNet(nn.Module):
         x = self.proj_head(x)
         return x
 
-def CoMakNet_tiny(pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay= None, **kwargs):
-    model = CoMakNet(stem_chs=[64, 32, 64],
-                   depths=[2, 2, 6, 1],
-                   dims=[64, 128, 192, 384],
-                   path_dropout=0.1, **kwargs)
+
+def CoMakNet_tiny(
+    pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay=None, **kwargs
+):
+    model = CoMakNet(
+        stem_chs=[64, 32, 64],
+        depths=[2, 2, 6, 1],
+        dims=[64, 128, 192, 384],
+        path_dropout=0.1,
+        **kwargs,
+    )
     return model

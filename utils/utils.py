@@ -1,33 +1,53 @@
-import torch
-from torch import nn
-from functools import partial
 import math
+from functools import partial
+
+import torch
 import torch.nn as nn
 from timm.models.layers import DropPath
+from torch import nn
+
 
 def merge_pre_bn(module, pre_bn_1, pre_bn_2=None):
-    """ Merge pre BN to reduce inference runtime.
-    """
+    """Merge pre BN to reduce inference runtime."""
     weight = module.weight.data
     if module.bias is None:
-        zeros = torch.zeros(module.out_channels, device=weight.device).type(weight.type())
+        zeros = torch.zeros(module.out_channels, device=weight.device).type(
+            weight.type()
+        )
         module.bias = nn.Parameter(zeros)
     bias = module.bias.data
-    assert pre_bn_1.track_running_stats is True, "Unsupport bn_module.track_running_stats is False"
+    assert pre_bn_1.track_running_stats is True, (
+        "Unsupport bn_module.track_running_stats is False"
+    )
     assert pre_bn_1.affine is True, "Unsupport bn_module.affine is False"
     if pre_bn_2 is None:
         scale_invstd = pre_bn_1.running_var.add(pre_bn_1.eps).pow(-0.5)
         extra_weight = scale_invstd * pre_bn_1.weight
-        extra_bias = pre_bn_1.bias - pre_bn_1.weight * pre_bn_1.running_mean * scale_invstd
+        extra_bias = (
+            pre_bn_1.bias - pre_bn_1.weight * pre_bn_1.running_mean * scale_invstd
+        )
     else:
-        assert pre_bn_2.track_running_stats is True, "Unsupport bn_module.track_running_stats is False"
+        assert pre_bn_2.track_running_stats is True, (
+            "Unsupport bn_module.track_running_stats is False"
+        )
         assert pre_bn_2.affine is True, "Unsupport bn_module.affine is False"
 
         scale_invstd_1 = pre_bn_1.running_var.add(pre_bn_1.eps).pow(-0.5)
         scale_invstd_2 = pre_bn_2.running_var.add(pre_bn_2.eps).pow(-0.5)
 
-        extra_weight = scale_invstd_1 * pre_bn_1.weight * scale_invstd_2 * pre_bn_2.weight
-        extra_bias = scale_invstd_2 * pre_bn_2.weight *(pre_bn_1.bias - pre_bn_1.weight * pre_bn_1.running_mean * scale_invstd_1 - pre_bn_2.running_mean) + pre_bn_2.bias
+        extra_weight = (
+            scale_invstd_1 * pre_bn_1.weight * scale_invstd_2 * pre_bn_2.weight
+        )
+        extra_bias = (
+            scale_invstd_2
+            * pre_bn_2.weight
+            * (
+                pre_bn_1.bias
+                - pre_bn_1.weight * pre_bn_1.running_mean * scale_invstd_1
+                - pre_bn_2.running_mean
+            )
+            + pre_bn_2.bias
+        )
 
     if isinstance(module, nn.Linear):
         extra_bias = weight @ extra_bias
@@ -43,6 +63,7 @@ def merge_pre_bn(module, pre_bn_1, pre_bn_2=None):
     module.weight.data = weight
     module.bias.data = bias
 
+
 def _make_divisible(v, divisor, min_value=None):
     if min_value is None:
         min_value = divisor
@@ -52,22 +73,33 @@ def _make_divisible(v, divisor, min_value=None):
         new_v += divisor
     return new_v
 
+
 class StarReLU(nn.Module):
     """
     StarReLU: s * relu(x) ** 2 + b
     """
-    def __init__(self, scale_value=1.0, bias_value=0.0,
-        scale_learnable=True, bias_learnable=True,
-        mode=None, inplace=False):
+
+    def __init__(
+        self,
+        scale_value=1.0,
+        bias_value=0.0,
+        scale_learnable=True,
+        bias_learnable=True,
+        mode=None,
+        inplace=False,
+    ):
         super().__init__()
         self.inplace = inplace
         self.relu = nn.ReLU(inplace=inplace)
-        self.scale = nn.Parameter(scale_value * torch.ones(1),
-            requires_grad=scale_learnable)
-        self.bias = nn.Parameter(bias_value * torch.ones(1),
-            requires_grad=bias_learnable)
+        self.scale = nn.Parameter(
+            scale_value * torch.ones(1), requires_grad=scale_learnable
+        )
+        self.bias = nn.Parameter(
+            bias_value * torch.ones(1), requires_grad=bias_learnable
+        )
+
     def forward(self, x):
-        return self.scale * self.relu(x)**2 + self.bias
+        return self.scale * self.relu(x) ** 2 + self.bias
 
 
 class SepConv(nn.Module):
@@ -77,18 +109,31 @@ class SepConv(nn.Module):
     - Added inverted residual connection for better performance.
     """
 
-    def __init__(self, dim, expansion_ratio=2,
-                 act1_layer=StarReLU, act2_layer=nn.Identity,
-                 bias=False, kernel_size=7, padding=3, residual=False,
-                 **kwargs, ):
+    def __init__(
+        self,
+        dim,
+        expansion_ratio=2,
+        act1_layer=StarReLU,
+        act2_layer=nn.Identity,
+        bias=False,
+        kernel_size=7,
+        padding=3,
+        residual=False,
+        **kwargs,
+    ):
         super().__init__()
         self.residual = residual
         med_channels = int(expansion_ratio * dim)
         self.pwconv1 = nn.Linear(dim, med_channels, bias=bias)
         self.act1 = act1_layer()
         self.dwconv = nn.Conv2d(
-            med_channels, med_channels, kernel_size=kernel_size,
-            padding=padding, groups=med_channels, bias=bias)  # depthwise conv
+            med_channels,
+            med_channels,
+            kernel_size=kernel_size,
+            padding=padding,
+            groups=med_channels,
+            bias=bias,
+        )  # depthwise conv
         self.act2 = act2_layer()
         self.pwconv2 = nn.Linear(med_channels, dim, bias=bias)
 
@@ -104,8 +149,11 @@ class SepConv(nn.Module):
 
         x = self.act2(x)
         x = self.pwconv2(x)
-        x = x + shortcut if self.residual else x  # Inverted residual (in the bottlenech layers)
+        x = (
+            x + shortcut if self.residual else x
+        )  # Inverted residual (in the bottlenech layers)
         return x
+
 
 class h_sigmoid(nn.Module):
     def __init__(self, inplace=True):
@@ -123,6 +171,7 @@ class h_swish(nn.Module):
 
     def forward(self, x):
         return x * self.sigmoid(x)
+
 
 class ECALayer(nn.Module):
     def __init__(self, channel, gamma=2, b=1, sigmoid=True):
@@ -145,16 +194,15 @@ class ECALayer(nn.Module):
         return x * y.expand_as(x)
 
 
-
 class SELayer(nn.Module):
     def __init__(self, channel, reduction=4):
         super(SELayer, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Sequential(
-                nn.Linear(channel, channel // reduction),
-                nn.ReLU(inplace=True),
-                nn.Linear(channel // reduction, channel),
-                h_sigmoid()
+            nn.Linear(channel, channel // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel),
+            h_sigmoid(),
         )
 
     def forward(self, x):
@@ -162,6 +210,7 @@ class SELayer(nn.Module):
         y = self.avg_pool(x).view(b, c)
         y = self.fc(y).view(b, c, 1, 1)
         return x * y
+
 
 # Channel first
 class ProjectionGating(nn.Module):
@@ -172,7 +221,9 @@ class ProjectionGating(nn.Module):
 
         self.act_mid = nn.ReLU()
 
-        self.pw_expand = nn.Conv2d(Cp, C, kernel_size=1, stride=1, padding=0, bias=False)
+        self.pw_expand = nn.Conv2d(
+            Cp, C, kernel_size=1, stride=1, padding=0, bias=False
+        )
         self.act_gate = nn.Sigmoid()
 
     def forward(self, x):
@@ -183,3 +234,100 @@ class ProjectionGating(nn.Module):
         x = self.act_gate(x)  # gating
         return x
 
+
+# Mamba2
+class tTensor(torch.Tensor):
+    @property
+    def shape(self):
+        shape = super().shape
+        return tuple([int(s) for s in shape])
+
+
+def to_ttensor(*args):
+    if len(args) > 1:
+        return tuple(tTensor(x) for x in args)
+    return tTensor(args[0])
+
+
+class Scale(nn.Module):
+    """
+    Scale vector by element multiplications.
+    """
+
+    def __init__(self, dim, init_value=1.0, trainable=True):
+        super().__init__()
+        self.scale = nn.Parameter(init_value * torch.ones(dim), requires_grad=trainable)
+
+    def forward(self, x):
+        return x * self.scale
+
+
+# for linear-mode in VSSD orginal
+def rope(x, shape, base=10000):
+    channel_dims, feature_dim = shape[:-1], shape[-1]
+    k_max = feature_dim // (2 * len(channel_dims))
+
+    assert feature_dim % k_max == 0
+
+    # angles
+    theta_ks = 1 / (base ** (torch.arange(k_max, device=x.device) / k_max))
+    angles = torch.cat(
+        [
+            t.unsqueeze(-1) * theta_ks
+            for t in torch.meshgrid(
+                [torch.arange(d, device=x.device) for d in channel_dims], indexing="ij"
+            )
+        ],
+        dim=-1,
+    )
+
+    # rotation
+    rotations_re = torch.cos(angles).unsqueeze(dim=-1)
+    rotations_im = torch.sin(angles).unsqueeze(dim=-1)
+
+    x = x.reshape(*x.shape[:-1], -1, 2)
+    x_re = x[..., :1]
+    x_im = x[..., 1:]
+    pe_x = torch.cat(
+        [
+            x_re * rotations_re - x_im * rotations_im,
+            x_im * rotations_re + x_re * rotations_im,
+        ],
+        dim=-1,
+    )
+    return pe_x.flatten(-2)
+
+
+class RoPE(torch.nn.Module):
+    r"""Rotary Positional Embedding."""
+
+    def __init__(self, shape, base=10000):
+        super(RoPE, self).__init__()
+
+        channel_dims, feature_dim = shape[:-1], shape[-1]
+        k_max = feature_dim // (2 * len(channel_dims))
+
+        assert feature_dim % k_max == 0
+
+        # angles
+        theta_ks = 1 / (base ** (torch.arange(k_max) / k_max))
+        angles = torch.cat(
+            [
+                t.unsqueeze(-1) * theta_ks
+                for t in torch.meshgrid(
+                    [torch.arange(d) for d in channel_dims], indexing="ij"
+                )
+            ],
+            dim=-1,
+        )
+
+        # rotation
+        rotations_re = torch.cos(angles).unsqueeze(dim=-1)
+        rotations_im = torch.sin(angles).unsqueeze(dim=-1)
+        rotations = torch.cat([rotations_re, rotations_im], dim=-1)
+        self.register_buffer("rotations", rotations)
+
+    def forward(self, x):
+        x = torch.view_as_complex(x.reshape(*x.shape[:-1], -1, 2))
+        pe_x = torch.view_as_complex(self.rotations) * x
+        return torch.view_as_real(pe_x).flatten(-2)
